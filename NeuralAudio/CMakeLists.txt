@@ -140,6 +140,8 @@ set(SOURCES
 	LSTMDynamic.h
 	InternalModel.h
 	CompositeModel.h
+	Neon8.h
+	PolyphaseModel.h
 	TemplateHelper.h)
 
 if(BUILD_NAMCORE)

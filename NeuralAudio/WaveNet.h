@@ -4,12 +4,14 @@
 // with some template ideas from https://github.com/jatinchowdhury18/RTNeural-NAM
 
 #include <array>
+#include <type_traits>
 #include <Eigen/Dense>
 #include <Eigen/Core>
 #include "TemplateHelper.h"
 #include "Activation.h"
 #include "ChannelBuffer.h"
 #include "MatMul.h"
+#include "Neon8.h"
 
 #ifndef WAVENET_MAX_NUM_FRAMES
 #define WAVENET_MAX_NUM_FRAMES 64
@@ -136,11 +138,37 @@ namespace NeuralAudio
 			return channelBuffer.buffer.Slice(channelBuffer.bufferStart, numFrames);
 		}
 
+#if NEURALAUDIO_NEON_8CH
+		static constexpr bool HasNeon8 = std::is_same_v<T, float> && (InChannels == 8) && (OutChannels == 8);
+
+		// Bias-free convolution into an 8-channel frame buffer (NEON).
+		inline void ProcessNeon8NoBias(T* __restrict outputPtr, const size_t numFrames)
+		{
+			static_assert(HasNeon8);
+
+			Neon8::DilatedConv<KernelSize, Dilation>(channelBuffer.buffer.GetDataConst(channelBuffer.bufferStart), outputPtr, weightPtrs.data(), numFrames);
+		}
+
+		const T* GetBiasData() const
+		{
+			static_assert(DoBias);
+
+			return bias.data();
+		}
+#endif
+
 		inline void Process(const ChannelRowSpan<T, OutChannels>& output)
 		{
 			const size_t numFrames = output.GetNumCols();
 			T* __restrict outputPtr = output.GetData();
 
+#if NEURALAUDIO_NEON_8CH
+			if constexpr (HasNeon8)
+			{
+				ProcessNeon8NoBias(outputPtr, numFrames);
+			}
+			else
+#endif
 #if MULTIFRAME_8X8_CONVOLUTION != 0
 			if constexpr ((((InChannels == 8) && (OutChannels == 8)) || ((InChannels == 16) && (OutChannels == 16)) || ((InChannels == 4) && (OutChannels == 4)) || ((InChannels == 2) && (OutChannels == 2))) && DoBias)
 			{
@@ -291,7 +319,7 @@ namespace NeuralAudio
 
 	private:
 		alignas(32) std::array<ChannelBuffer<T, OutChannels, InChannels>, KernelSize> weights;	// consider making this a contiguous block of data instead of block of ChannelBuffers
-		std::array<T *, KernelSize> weightPtrs;
+		std::array<const T *, KernelSize> weightPtrs;
 
 		BiasType bias;
 	};
@@ -462,6 +490,15 @@ namespace NeuralAudio
 		template <bool NeedOutput = true>
 		void Process(const ChannelRowSpan<T, ConditionSize>& condition, const ChannelRowSpan<T, Channels>& headInput, const ChannelRowSpan<T, Channels>& output)
 		{
+#if NEURALAUDIO_NEON_8CH
+			if constexpr (std::is_same_v<T, float> && (Channels == 8) && (ConditionSize == 1))
+			{
+				ProcessNeon8<NeedOutput>(condition, headInput, output);
+
+				return;
+			}
+#endif
+
 			size_t numFrames = output.GetNumCols();
 
 			auto block = state.Slice(numFrames);
@@ -492,6 +529,101 @@ namespace NeuralAudio
 
 			//output.AddData(conv1D.GetInputBuffer(numFrames));
 		}
+
+#if NEURALAUDIO_NEON_8CH
+	private:
+		// Same math as the generic path, fused into two passes over the block:
+		//   z = conv(h) + bias + mixin * condition;  z = act(z);  head += z
+		//   out = oneByOne(z) + h  (residual)
+		template <bool NeedOutput>
+		void ProcessNeon8(const ChannelRowSpan<T, ConditionSize>& condition, const ChannelRowSpan<T, Channels>& headInput, const ChannelRowSpan<T, Channels>& output)
+		{
+			const size_t numFrames = output.GetNumCols();
+
+			float* __restrict z = state.GetData();
+
+			conv1D.ProcessNeon8NoBias(z, numFrames);
+
+			const float* __restrict cond = condition.GetDataConst();
+			const float* convBias = conv1D.GetBiasData();
+			const float* mix = inputMixin.GetWeights().GetDataConst();
+
+			const float32x4_t bias0 = vld1q_f32(convBias), bias1 = vld1q_f32(convBias + 4);
+			const float32x4_t mix0 = vld1q_f32(mix), mix1 = vld1q_f32(mix + 4);
+
+			if constexpr (Activation == EActivationType::LeakyReLU)
+			{
+				ApplyHeadAndOutput<NeedOutput, true>(z, cond, bias0, bias1, mix0, mix1, headInput, output);
+			}
+			else
+			{
+				for (size_t f = 0; f < numFrames; f++)
+				{
+					float32x4_t z0 = vaddq_f32(vld1q_f32(z + f * 8), bias0);
+					float32x4_t z1 = vaddq_f32(vld1q_f32(z + f * 8 + 4), bias1);
+
+					z0 = vfmaq_n_f32(z0, mix0, cond[f]);
+					z1 = vfmaq_n_f32(z1, mix1, cond[f]);
+
+					vst1q_f32(z + f * 8, z0);
+					vst1q_f32(z + f * 8 + 4, z1);
+				}
+
+				auto block = state.Slice(numFrames);
+
+				WAVENET_MATH<T>::template Tanh<Channels>(block);
+
+				ApplyHeadAndOutput<NeedOutput, false>(z, cond, bias0, bias1, mix0, mix1, headInput, output);
+			}
+		}
+
+		// PreActivation: z still needs bias + mixin + LeakyReLU applied.
+		template <bool NeedOutput, bool PreActivation>
+		inline void ApplyHeadAndOutput(float* __restrict z, const float* __restrict cond, const float32x4_t bias0, const float32x4_t bias1,
+			const float32x4_t mix0, const float32x4_t mix1, const ChannelRowSpan<T, Channels>& headInput, const ChannelRowSpan<T, Channels>& output)
+		{
+			const size_t numFrames = output.GetNumCols();
+
+			float* __restrict head = headInput.GetData();
+			float* __restrict out = output.GetData();
+			const float* __restrict residual = conv1D.GetInputBuffer(numFrames).GetDataConst();
+
+			const Neon8::Matrix8x8 w = Neon8::LoadMatrix(oneByOne.GetWeights().GetDataConst());
+			const float* outBias = oneByOne.GetBias().data();
+			const float32x4_t outBias0 = vld1q_f32(outBias), outBias1 = vld1q_f32(outBias + 4);
+
+			for (size_t f = 0; f < numFrames; f++)
+			{
+				float32x4_t z0 = vld1q_f32(z + f * 8);
+				float32x4_t z1 = vld1q_f32(z + f * 8 + 4);
+
+				if constexpr (PreActivation)
+				{
+					z0 = vfmaq_n_f32(vaddq_f32(z0, bias0), mix0, cond[f]);
+					z1 = vfmaq_n_f32(vaddq_f32(z1, bias1), mix1, cond[f]);
+
+					z0 = Neon8::LeakyReLU(z0);
+					z1 = Neon8::LeakyReLU(z1);
+				}
+
+				vst1q_f32(head + f * 8, vaddq_f32(vld1q_f32(head + f * 8), z0));
+				vst1q_f32(head + f * 8 + 4, vaddq_f32(vld1q_f32(head + f * 8 + 4), z1));
+
+				if constexpr (NeedOutput)
+				{
+					float32x4_t o0, o1;
+
+					Neon8::Multiply(w, z0, z1, o0, o1);
+
+					o0 = vaddq_f32(vaddq_f32(o0, outBias0), vld1q_f32(residual + f * 8));
+					o1 = vaddq_f32(vaddq_f32(o1, outBias1), vld1q_f32(residual + f * 8 + 4));
+
+					vst1q_f32(out + f * 8, o0);
+					vst1q_f32(out + f * 8 + 4, o1);
+				}
+			}
+		}
+#endif
 	};
 
 	template <int... values>

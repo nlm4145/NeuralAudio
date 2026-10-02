@@ -15,6 +15,10 @@
 #define DEFAULT_INPUT_DBU 12
 #endif
 
+#ifndef DEFAULT_POLYPHASE_OVERSAMPLING
+#define DEFAULT_POLYPHASE_OVERSAMPLING true
+#endif
+
 namespace NeuralAudio
 {
 	enum EModelLoadMode
@@ -220,7 +224,23 @@ namespace NeuralAudio
 				this->externalSampleRate = sampleRate;
 			}
 
+			// When the external sample rate is an integer multiple F of a WaveNet's native
+			// rate, run it as F native-rate phases instead of scaling its dilations by F.
+			// Same output (up to float rounding), but each phase uses the fast
+			// native-rate kernels. Disable to get the dilation-scaling path.
+			void SetPolyphaseOversampling(bool enable)
+			{
+				polyphaseOversampling = enable;
+			}
+
+			bool GetPolyphaseOversampling()
+			{
+				return polyphaseOversampling;
+			}
+
 		protected:
+			NeuralModel* CreatePolyphaseFromNAMJson(const nlohmann::json& modelJson, int factor, bool doPrewarm);
+
 			EModelLoadMode lstmLoadMode = EModelLoadMode::Internal;
 			EModelLoadMode wavenetLoadMode = EModelLoadMode::Internal;
 			ECompositeModelLoadMode compositeLoadMode = ECompositeModelLoadMode::LoadAll;
@@ -228,6 +248,7 @@ namespace NeuralAudio
 			int defaultMaxAudioBufferSize = 128;
 			float defaultQualityScaleFactor = (float)DEFAULT_QUALITY_SCALE;
 			int externalSampleRate = 48000;
+			bool polyphaseOversampling = DEFAULT_POLYPHASE_OVERSAMPLING;
 	};
 
 }

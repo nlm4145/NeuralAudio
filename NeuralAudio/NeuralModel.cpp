@@ -9,6 +9,7 @@
 #include "RTNeuralModel.h"
 #include "InternalModel.h"
 #include "CompositeModel.h"
+#include "PolyphaseModel.h"
 
 namespace NeuralAudio
 {
@@ -89,6 +90,67 @@ namespace NeuralAudio
 		return true;
 	}
 
+	static int GetNAMModelSampleRate(const nlohmann::json& modelJson)
+	{
+		int modelSampleRate = 48000;
+
+		if (modelJson.contains("sample_rate") && modelJson.at("sample_rate").is_number())
+		{
+			modelSampleRate = (int)modelJson.at("sample_rate").get<float>();
+		}
+
+		return modelSampleRate;
+	}
+
+	// Factor F for running this model as F native-rate phases (see PolyphaseModel.h),
+	// or 1 if the polyphase decomposition doesn't apply. It applies exactly when the
+	// dilation scaling in OversampleNAMConfig would make the network phase-separable:
+	// a plain WaveNet with no post-stack head convolution and no condition DSP (neither
+	// of which OversampleNAMConfig rescales).
+	static int GetPolyphaseFactor(const nlohmann::json& modelJson, int externalSampleRate)
+	{
+		if (!modelJson.contains("architecture") || (modelJson.at("architecture") != "WaveNet"))
+			return 1;
+
+		const int modelSampleRate = GetNAMModelSampleRate(modelJson);
+
+		if ((modelSampleRate <= 0) || (externalSampleRate <= modelSampleRate) || ((externalSampleRate % modelSampleRate) != 0))
+			return 1;
+
+		if (!modelJson.contains("config"))
+			return 1;
+
+		const auto& config = modelJson.at("config");
+
+		if (config.contains("condition_dsp") && !config.at("condition_dsp").is_null())
+			return 1;
+
+		if (config.contains("head") && !config.at("head").is_null())
+		{
+			const auto& head = config.at("head");
+
+			if (!head.contains("kernel_sizes"))
+				return 1;
+
+			for (const auto& kernelSize : head.at("kernel_sizes"))
+			{
+				if (!kernelSize.is_number_integer() || (kernelSize.get<int>() != 1))
+					return 1;
+			}
+		}
+
+		if (!config.contains("layers"))
+			return 1;
+
+		for (const auto& layer : config.at("layers"))
+		{
+			if (!layer.contains("dilations"))
+				return 1;
+		}
+
+		return externalSampleRate / modelSampleRate;
+	}
+
 	static void OversampleNAMConfig(nlohmann::json& modelJson, int externalSampleRate)
 	{
 		std::string arch = modelJson.at("architecture");
@@ -96,12 +158,7 @@ namespace NeuralAudio
 		if (arch != "WaveNet")
 			return;
 
-		int modelSampleRate = 48000;
-
-		if (modelJson.contains("sample_rate") && modelJson.at("sample_rate").is_number())
-		{
-			modelSampleRate = (int)modelJson.at("sample_rate").get<float>();
-		}
+		const int modelSampleRate = GetNAMModelSampleRate(modelJson);
 
 		if (modelSampleRate == externalSampleRate)
 			return;	// No oversampling required
@@ -341,6 +398,19 @@ namespace NeuralAudio
 
 		NeuralModelImpl* newModel = nullptr;
 
+		if ((extension == ".nam") && polyphaseOversampling)
+		{
+			const int polyphaseFactor = GetPolyphaseFactor(modelJson, externalSampleRate);
+
+			if (polyphaseFactor > 1)
+			{
+				NeuralModel* polyphaseModel = CreatePolyphaseFromNAMJson(modelJson, polyphaseFactor, doPrewarm);
+
+				if (polyphaseModel != nullptr)
+					return polyphaseModel;
+			}
+		}
+
 		if (extension == ".nam")
 		{
 			OversampleNAMConfig(modelJson, externalSampleRate);
@@ -578,5 +648,78 @@ namespace NeuralAudio
 		}
 
 		return newModel;
+	}
+
+	NeuralModel* NeuralModelLoader::CreatePolyphaseFromNAMJson(const nlohmann::json& modelJson, int factor, bool doPrewarm)
+	{
+		// Build each phase at the model's native rate, so OversampleNAMConfig leaves the
+		// dilations alone and the normal static/A2 architecture matching applies.
+		const int savedExternalSampleRate = externalSampleRate;
+		const int savedDefaultMaxAudioBufferSize = defaultMaxAudioBufferSize;
+
+		externalSampleRate = GetNAMModelSampleRate(modelJson);
+		defaultMaxAudioBufferSize = (savedDefaultMaxAudioBufferSize + factor - 1) / factor + 1;
+
+		std::vector<NeuralModelImpl*> phases;
+		phases.reserve((size_t)factor);
+
+		auto restore = [&]()
+		{
+			externalSampleRate = savedExternalSampleRate;
+			defaultMaxAudioBufferSize = savedDefaultMaxAudioBufferSize;
+		};
+
+		auto deletePhases = [&]()
+		{
+			for (auto* phase : phases)
+			{
+				delete phase;
+			}
+
+			phases.clear();
+		};
+
+		try
+		{
+			for (int phase = 0; phase < factor; phase++)
+			{
+				nlohmann::json phaseJson = modelJson;
+
+				NeuralModel* model = CreateFromJson(phaseJson, ".nam", false);
+				NeuralModelImpl* impl = dynamic_cast<NeuralModelImpl*>(model);
+
+				if (impl == nullptr)
+				{
+					delete model;
+					deletePhases();
+					restore();
+
+					return nullptr;	// Fall back to dilation scaling
+				}
+
+				phases.push_back(impl);
+			}
+		}
+		catch (...)
+		{
+			deletePhases();
+			restore();
+
+			throw;
+		}
+
+		restore();
+
+		PolyphaseModel* model = new PolyphaseModel(std::move(phases));
+
+		model->SetModelLoader(this);
+		model->SetMaxAudioBufferSize(defaultMaxAudioBufferSize);
+
+		if (doPrewarm)
+		{
+			model->Prewarm();
+		}
+
+		return model;
 	}
 }
