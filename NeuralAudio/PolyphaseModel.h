@@ -23,6 +23,17 @@ namespace NeuralAudio
 	class PolyphaseModel : public NeuralModelImpl
 	{
 		public:
+			// Host-owned executor. execute must finish each range exactly once before
+			// returning; no model or scratch may outlive this synchronous call.
+			class Executor
+			{
+				public:
+					virtual ~Executor() = default;
+					virtual void execute(void (*process)(void*, size_t, size_t) noexcept,
+					                     void* context, size_t phaseCount,
+					                     size_t minimumPhaseSamples) noexcept = 0;
+			};
+
 			explicit PolyphaseModel(std::vector<NeuralModelImpl*>&& phaseModels)
 				: phases(std::move(phaseModels))
 			{
@@ -146,6 +157,12 @@ namespace NeuralAudio
 
 			void Process(float* input, float* output, size_t numSamples) override
 			{
+				ProcessWithExecutor(input, output, numSamples, nullptr);
+			}
+
+			void ProcessWithExecutor(float* input, float* output, size_t numSamples,
+			                         Executor* executor)
+			{
 				const size_t maxChunk = scratch.size();
 
 				if (maxChunk == 0)
@@ -172,13 +189,13 @@ namespace NeuralAudio
 
 					phaseOffsets[numPhases] = pos;
 
-					for (size_t p = 0; p < numPhases; p++)
-					{
-						const size_t count = phaseOffsets[p + 1] - phaseOffsets[p];
-
-						if (count > 0)
-							phases[p]->Process(buffer + phaseOffsets[p], buffer + phaseOffsets[p], count);
-					}
+					if (executor)
+						executor->execute([](void* context, size_t begin, size_t end) noexcept {
+							auto& self = *static_cast<PolyphaseModel*>(context);
+							self.ProcessPhases(begin, end);
+						}, this, numPhases, chunk / numPhases);
+					else
+						ProcessPhases(0, numPhases);
 
 					// Interleave back. Input was fully copied first, so in-place is fine.
 					for (size_t p = 0; p < numPhases; p++)
@@ -208,6 +225,17 @@ namespace NeuralAudio
 			}
 
 		private:
+			void ProcessPhases(size_t begin, size_t end)
+			{
+				for (size_t p = begin; p < end; ++p)
+				{
+					const size_t count = phaseOffsets[p + 1] - phaseOffsets[p];
+					float* samples = scratch.data() + phaseOffsets[p];
+					if (count > 0)
+						phases[p]->Process(samples, samples, count);
+				}
+			}
+
 			std::vector<NeuralModelImpl*> phases;
 			std::vector<size_t> phaseOffsets;
 			std::vector<float> scratch;

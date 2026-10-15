@@ -40,6 +40,14 @@ namespace NeuralAudio
 				return currentModelIndex.load();
 			}
 
+			// Snapshot for synchronous host processing; model switches and destruction
+			// must not overlap use of the returned child.
+			NeuralModelImpl* GetCurrentModel()
+			{
+				const int index = currentModelIndex.load();
+				return index < 0 ? nullptr : models[index];
+			}
+
 			bool IsModelChangeRealtimeSafe(int newIndex)
 			{
 				if (newIndex == currentModelIndex.load())
